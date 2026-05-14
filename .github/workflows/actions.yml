@@ -1,4 +1,4 @@
-name: Build and Push Agentic SRE
+name: Agentic SRE
 
 on:
   push:
