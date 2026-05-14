@@ -1,5 +1,7 @@
 import os
 import asyncio
+import sys
+import logging
 from typing import Annotated, TypedDict
 
 from ollama import AsyncClient
@@ -13,6 +15,14 @@ from telebot.async_telebot import AsyncTeleBot
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 # --- CONFIGURATION ---
 MCP_URL = os.getenv("MCP_URL", "http://mcp-k8s:8080/sse")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
@@ -22,7 +32,6 @@ MODEL = os.getenv("MODEL", "qwen3.6:27b")
 DB_PATH = "agent_state.db"
 
 bot = AsyncTeleBot(TG_TOKEN)
-# Initialize the Async Client with the correct host
 ollama_client = AsyncClient(host=OLLAMA_URL)
 
 class AgentState(TypedDict):
@@ -55,19 +64,13 @@ async def create_mcp_tools():
 
 # --- AGENT LOGIC ---
 async def call_model(state: AgentState):
-    """Bridge using the AsyncClient correctly."""
     messages = []
     for m in state['messages']:
         role = "user" if isinstance(m, HumanMessage) else "assistant"
         if isinstance(m, ToolMessage): role = "tool"
         messages.append({"role": role, "content": m.content})
 
-    # Correct usage of the async client
-    response = await ollama_client.chat(
-        model=MODEL,
-        messages=messages
-    )
-
+    response = await ollama_client.chat(model=MODEL, messages=messages)
     content = response['message'].get('content', "")
     return {"messages": [AIMessage(content=content)]}
 
@@ -93,6 +96,7 @@ async def process_graph_event(event):
     if "messages" in event:
         last_msg = event["messages"][-1]
         if isinstance(last_msg, AIMessage) and last_msg.content:
+            logger.info(f"AI Response: {last_msg.content[:50]}...")
             if any(kw in last_msg.content.lower() for kw in ["propose", "fix", "execute"]):
                 markup = InlineKeyboardMarkup()
                 markup.add(InlineKeyboardButton("✅ Approve", callback_data="approve"))
@@ -115,12 +119,12 @@ def register_bot_handlers(graph, config):
 
 # --- MAIN RUNNER ---
 async def main():
-    print("🛰️ Connecting to MCP SSE endpoint...")
+    logger.info("🛰️ Connecting to MCP SSE endpoint...")
     try:
         tools = await create_mcp_tools()
-        print(f"✅ Loaded {len(tools)} tools.")
+        logger.info(f"✅ Loaded {len(tools)} tools.")
     except Exception as e:
-        print(f"❌ MCP Connection Error: {e}")
+        logger.error(f"❌ MCP Connection Error: {e}")
         return
 
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as saver:
@@ -128,16 +132,24 @@ async def main():
         config = {"configurable": {"thread_id": "sre_session_1"}}
         register_bot_handlers(graph, config)
 
-        print("🤖 Agent Online. Monitoring Cluster...")
-        initial_input = {"messages": [HumanMessage(content="Scan the cluster and propose fixes.")]}
+        logger.info("🤖 Agent Online. Starting initial scan...")
 
-        async for event in graph.astream(initial_input, config, stream_mode="values"):
-            await process_graph_event(event)
+        # Start bot polling in the background so it doesn't block the graph
+        polling_task = asyncio.create_task(bot.polling(non_stop=True))
 
-        await bot.polling(non_stop=True)
+        initial_input = {"messages": [HumanMessage(content="Scan cluster for issues and propose fixes.")]}
+
+        try:
+            async for event in graph.astream(initial_input, config, stream_mode="values"):
+                await process_graph_event(event)
+
+            # Keep main alive while polling runs
+            await polling_task
+        except Exception as e:
+            logger.error(f"Graph Error: {e}")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Shutdown.")
+        logger.info("👋 Shutdown.")
