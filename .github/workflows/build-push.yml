@@ -1,0 +1,58 @@
+name: Build and Push Agentic SRE
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: agentic-sre
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # pull the source code
+      packages: write # push the Docker image
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Required to build for ARM64 on x86 GitHub runners
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # Enables advanced Docker features, like building for multiple architectures and better caching
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./agentic-sre
+          platforms: linux/arm64 # build for ARM64 architecture
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Optimized caching
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
