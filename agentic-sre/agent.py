@@ -15,7 +15,7 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
-MCP_URL = os.getenv("MCP_URL", "http://mcp-k8s-service:8080/sse")
+MCP_URL = os.getenv("MCP_URL", "http://mcp-k8s:8080/sse")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
