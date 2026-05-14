@@ -60,10 +60,14 @@ async def fetch_mcp_tools():
                                 async with ClientSession(r, w) as sess:
                                     await sess.initialize()
                                     res = await sess.call_tool(t_name, actual_args)
-                                    return str(res.content)
+                                    # Handle structured content from MCP
+                                    if hasattr(res, 'content'):
+                                        return str(res.content)
+                                    return str(res)
                         except Exception as e:
-                            logger.error(f"❌ MCP Tool Execution Error ({t_name}): {e}")
-                            return f"Error executing {t_name}: {str(e)}"
+                            error_msg = f"Error executing {t_name}: {str(e)}"
+                            logger.error(f"❌ {error_msg}")
+                            return error_msg
                     return func
 
                 tools_list.append(StructuredTool.from_function(
@@ -92,7 +96,7 @@ async def call_model(state: AgentState, tools_for_ollama: list):
         elif isinstance(m, ToolMessage): role = "tool"
         else: role = "assistant"
 
-        msg_obj = {"role": role, "content": m.content}
+        msg_obj = {"role": role, "content": m.content or ""}
         if isinstance(m, ToolMessage):
             msg_obj["tool_call_id"] = getattr(m, 'tool_call_id', None)
         formatted_messages.append(msg_obj)
@@ -105,9 +109,9 @@ async def call_model(state: AgentState, tools_for_ollama: list):
             tools=tools_for_ollama
         )
 
-        msg = response['message']
+        msg = response.get('message', {})
         content = msg.get('content', '')
-        raw_tool_calls = msg.get('tool_calls', [])
+        raw_tool_calls = msg.get('tool_calls', []) or []
 
         tool_calls = []
         for tc in raw_tool_calls:
@@ -117,12 +121,16 @@ async def call_model(state: AgentState, tools_for_ollama: list):
                     "args": tc.function.arguments,
                     "id": getattr(tc, 'id', f"call_{tc.function.name}")
                 })
-            else:
-                tool_calls.append(tc)
+            elif isinstance(tc, dict) and 'function' in tc:
+                tool_calls.append({
+                    "name": tc['function'].get('name'),
+                    "args": tc['function'].get('arguments'),
+                    "id": tc.get('id', f"call_{tc['function'].get('name')}")
+                })
 
         return {"messages": [AIMessage(content=content, tool_calls=tool_calls)]}
     except Exception as e:
-        logger.error(f"❌ LLM Error: {e}")
+        logger.error(f"❌ LLM Error: {e}", exc_info=True)
         return {"messages": [AIMessage(content=f"Error contacting LLM provider: {str(e)}")]}
 
 # --- GRAPH ORCHESTRATION ---
@@ -163,14 +171,16 @@ async def notify_telegram(event):
             markup.add(InlineKeyboardButton("✅ Approve Execution", callback_data="approve"))
             markup.add(InlineKeyboardButton("❌ Reject", callback_data="reject"))
 
-            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Proposal:** {last_msg.content}\n\n**Tools to run:** `{t_names}`"
+            # Content might be empty if the LLM only provided tool calls
+            proposal = last_msg.content or "The agent has identified a required tool execution."
+            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Proposal:** {proposal}\n\n**Tools to run:** `{t_names}`"
             await bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="Markdown")
         elif last_msg.content:
             await bot.send_message(CHAT_ID, f"ℹ️ **Agent Report:**\n{last_msg.content}")
 
     elif isinstance(last_msg, ToolMessage):
         # Result of execution
-        short_res = last_msg.content[:800] + ("..." if len(last_msg.content) > 800 else "")
+        short_res = str(last_msg.content)[:800] + ("..." if len(str(last_msg.content)) > 800 else "")
         await bot.send_message(CHAT_ID, f"📦 **Tool Output:**\n```\n{short_res}\n```", parse_mode="Markdown")
 
 # --- MAIN LOOP ---
@@ -192,7 +202,6 @@ async def main():
         async def handle_approval(call):
             if call.data == "approve":
                 await bot.answer_callback_query(call.id, "Executing...")
-                # Stream the resumption
                 async for event in graph.astream(None, config, stream_mode="values"):
                     await notify_telegram(event)
             else:
@@ -200,15 +209,14 @@ async def main():
                 await bot.send_message(CHAT_ID, "🛑 **Manual Override:** Action cancelled.")
 
         logger.info("🔍 Performing initial cluster health check...")
-        prompt = "Review the ai-agents namespace. If any pod is not Running, use your tools to troubleshoot and propose a fix."
+        prompt = "Review the ai-agents namespace. Identify any pods not in 'Running' state. Propose and execute fixes only after approval."
         initial_input = {"messages": [HumanMessage(content=prompt)]}
 
         async for event in graph.astream(initial_input, config, stream_mode="values"):
             await notify_telegram(event)
 
         logger.info("🤖 System Idle. Waiting for Telegram or Kubernetes events...")
-        # Add non_stop and retry_on_error to handle the 409 Conflict gracefully
-        await bot.polling(non_stop=True, interval=2, timeout=20)
+        await bot.polling(non_stop=True, interval=3, timeout=30)
 
 if __name__ == "__main__":
     try:
