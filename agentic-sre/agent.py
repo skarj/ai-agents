@@ -32,7 +32,8 @@ MODEL = os.getenv("MODEL", "qwen3.6:27b")
 DB_PATH = "agent_state.db"
 
 bot = AsyncTeleBot(TG_TOKEN)
-ollama_client = AsyncClient(host=OLLAMA_URL)
+# Set a timeout for Ollama so we don't hang forever
+ollama_client = AsyncClient(host=OLLAMA_URL, timeout=120.0)
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], "The conversation history"]
@@ -48,10 +49,12 @@ async def create_mcp_tools():
             for t in mcp_tools.tools:
                 def create_fn(tool_name):
                     async def func(args: dict):
+                        logger.info(f"🛠️ Executing Tool: {tool_name} with args: {args}")
                         async with sse_client(MCP_URL) as (r, w):
                             async with ClientSession(r, w) as sess:
                                 await sess.initialize()
                                 res = await sess.call_tool(tool_name, args)
+                                logger.info(f"✅ Tool {tool_name} returned result.")
                                 return str(res.content)
                     return func
 
@@ -70,13 +73,15 @@ async def call_model(state: AgentState):
         if isinstance(m, ToolMessage): role = "tool"
         messages.append({"role": role, "content": m.content})
 
+    logger.info(f"🧠 Calling Ollama model: {MODEL}...")
     try:
         response = await ollama_client.chat(model=MODEL, messages=messages)
         content = response['message'].get('content', "")
+        logger.info("📡 Ollama responded successfully.")
         return {"messages": [AIMessage(content=content)]}
     except Exception as e:
-        logger.error(f"Ollama Error: {e}")
-        return {"messages": [AIMessage(content="Model failed to respond.")]}
+        logger.error(f"❌ Ollama Chat Error: {e}")
+        return {"messages": [AIMessage(content=f"Error: Model is unresponsive. {str(e)}")]}
 
 # --- GRAPH BUILDER ---
 def build_agent_graph(tools, checkpointer):
@@ -88,7 +93,9 @@ def build_agent_graph(tools, checkpointer):
     def router(state):
         last_message = state["messages"][-1]
         if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+            logger.info("↪️ Router: Moving to Action (Tool Call)")
             return "action"
+        logger.info("↪️ Router: Ending conversation/Wait for Human")
         return END
 
     builder.add_conditional_edges("agent", router)
@@ -100,7 +107,7 @@ async def process_graph_event(event):
     if "messages" in event:
         last_msg = event["messages"][-1]
         if isinstance(last_msg, AIMessage) and last_msg.content:
-            logger.info(f"AI Message sent to TG: {last_msg.content[:50]}...")
+            logger.info(f"📤 Sending update to Telegram (Chat ID: {CHAT_ID})")
             if any(kw in last_msg.content.lower() for kw in ["propose", "fix", "execute", "plan"]):
                 markup = InlineKeyboardMarkup()
                 markup.add(InlineKeyboardButton("✅ Approve", callback_data="approve"))
@@ -113,6 +120,7 @@ async def process_graph_event(event):
 def register_bot_handlers(graph, config):
     @bot.callback_query_handler(func=lambda call: True)
     async def handle_query(call):
+        logger.info(f"📥 Received Telegram Callback: {call.data}")
         if call.data == "approve":
             await bot.answer_callback_query(call.id, "Executing Action...")
             async for event in graph.astream(None, config, stream_mode="values"):
@@ -138,21 +146,20 @@ async def main():
 
         logger.info("🤖 Agent Online. Monitoring Cluster...")
 
-        # Start initial scan as a background task to keep it from blocking Telegram polling startup
+        # Background initial scan
         initial_input = {"messages": [HumanMessage(content="Scan cluster for health issues and propose fixes.")]}
 
         async def run_initial_scan():
+            logger.info("🏃 Starting Initial Scan Stream...")
             async for event in graph.astream(initial_input, config, stream_mode="values"):
                 await process_graph_event(event)
+            logger.info("🏁 Initial Scan Stream Finished.")
 
-        # Run both the bot and the scan
-        try:
-            await asyncio.gather(
-                bot.polling(non_stop=True, skip_pending=True, timeout=60),
-                run_initial_scan()
-            )
-        except Exception as e:
-            logger.error(f"Runtime Exception: {e}")
+        # Gather both polling and scan
+        await asyncio.gather(
+            bot.polling(non_stop=True, skip_pending=True, timeout=90),
+            run_initial_scan()
+        )
 
 if __name__ == "__main__":
     try:
