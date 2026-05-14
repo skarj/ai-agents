@@ -9,7 +9,7 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import StructuredTool
 from telebot.async_telebot import AsyncTeleBot
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -53,16 +53,24 @@ async def fetch_mcp_tools():
             for t in mcp_tools.tools:
                 def create_tool_fn(t_name=t.name):
                     async def func(**kwargs):
+                        # Extract arguments from LangChain's wrapper
                         actual_args = kwargs.get('v__args', kwargs)
+
+                        # Fallback for missing namespace: default to ai-agents
+                        if "namespace" in t.inputSchema.get("required", []) and "namespace" not in actual_args:
+                            logger.info(f"⚠️ Missing required namespace in {t_name}, defaulting to 'ai-agents'")
+                            actual_args["namespace"] = "ai-agents"
+
                         logger.info(f"🛠️ MCP CALL: {t_name} with {actual_args}")
                         try:
                             async with sse_client(MCP_URL) as (r, w):
                                 async with ClientSession(r, w) as sess:
                                     await sess.initialize()
                                     res = await sess.call_tool(t_name, actual_args)
-                                    # Handle structured content from MCP
-                                    if hasattr(res, 'content'):
-                                        return str(res.content)
+
+                                    # Handle MCP TextContent format specifically to give clean text back to LLM
+                                    if hasattr(res, 'content') and isinstance(res.content, list):
+                                        return "\n".join([item.text for item in res.content if hasattr(item, 'text')])
                                     return str(res)
                         except Exception as e:
                             error_msg = f"Error executing {t_name}: {str(e)}"
@@ -91,9 +99,18 @@ async def fetch_mcp_tools():
 async def call_model(state: AgentState, tools_for_ollama: list):
     """Feeds the cluster state to the LLM and retrieves the next action."""
     formatted_messages = []
+
+    # Prepend a system message if not present to guide the agent
+    if not any(isinstance(m, SystemMessage) for m in state['messages']):
+        formatted_messages.append({
+            "role": "system",
+            "content": "You are a Kubernetes SRE. When asked to check pods or health, focus on the 'ai-agents' namespace unless told otherwise. If a tool requires a namespace and you are unsure, use 'ai-agents'. Always call tools to verify facts before reporting."
+        })
+
     for m in state['messages']:
         if isinstance(m, HumanMessage): role = "user"
         elif isinstance(m, ToolMessage): role = "tool"
+        elif isinstance(m, SystemMessage): role = "system"
         else: role = "assistant"
 
         msg_obj = {"role": role, "content": m.content or ""}
@@ -171,16 +188,17 @@ async def notify_telegram(event):
             markup.add(InlineKeyboardButton("✅ Approve Execution", callback_data="approve"))
             markup.add(InlineKeyboardButton("❌ Reject", callback_data="reject"))
 
-            # Content might be empty if the LLM only provided tool calls
-            proposal = last_msg.content or "The agent has identified a required tool execution."
-            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Proposal:** {proposal}\n\n**Tools to run:** `{t_names}`"
+            # Show reasoning or fallback text
+            reasoning = last_msg.content or "The agent is initiating a diagnostics step."
+            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Reasoning:** {reasoning}\n\n**Tools to run:** `{t_names}`"
             await bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="Markdown")
         elif last_msg.content:
             await bot.send_message(CHAT_ID, f"ℹ️ **Agent Report:**\n{last_msg.content}")
 
     elif isinstance(last_msg, ToolMessage):
-        # Result of execution
-        short_res = str(last_msg.content)[:800] + ("..." if len(str(last_msg.content)) > 800 else "")
+        # Truncate and clean up the result for Telegram
+        output_text = str(last_msg.content)
+        short_res = output_text[:800] + ("..." if len(output_text) > 800 else "")
         await bot.send_message(CHAT_ID, f"📦 **Tool Output:**\n```\n{short_res}\n```", parse_mode="Markdown")
 
 # --- MAIN LOOP ---
@@ -209,7 +227,7 @@ async def main():
                 await bot.send_message(CHAT_ID, "🛑 **Manual Override:** Action cancelled.")
 
         logger.info("🔍 Performing initial cluster health check...")
-        prompt = "Review the ai-agents namespace. Identify any pods not in 'Running' state. Propose and execute fixes only after approval."
+        prompt = "Review the 'ai-agents' namespace. Identify any pods not in 'Running' state. Propose and execute fixes only after approval."
         initial_input = {"messages": [HumanMessage(content=prompt)]}
 
         async for event in graph.astream(initial_input, config, stream_mode="values"):
