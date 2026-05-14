@@ -1,17 +1,16 @@
 import os
 import asyncio
-import sqlite3
 from typing import Annotated, TypedDict
 
 import ollama
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain_core.tools import tool, StructuredTool
+from langchain_core.tools import StructuredTool
 from telebot.async_telebot import AsyncTeleBot
+from langgraph_checkpoint_sqlite import AsyncSqliteSaver
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
@@ -75,16 +74,13 @@ async def ask_human(state: AgentState):
     await bot.send_message(CHAT_ID, f"🚨 **SRE PROPOSAL:**\n\n{last_message}", reply_markup=markup, parse_mode="Markdown")
 
 # --- GRAPH BUILDER ---
-def build_agent_graph(tools):
-    memory = SqliteSaver(sqlite3.connect("/app/data/agent_state.db", check_same_thread=False))
-
+def build_agent_graph(tools, checkpointer):
     builder = StateGraph(AgentState)
     builder.add_node("agent", call_model)
     builder.add_node("action", ToolNode(tools))
 
     builder.set_entry_point("agent")
 
-    # Logic: If agent suggests a tool, we interrupt. If it just talks, we end.
     def router(state):
         if state["messages"][-1].additional_kwargs.get("tool_calls"):
             return "action"
@@ -93,37 +89,43 @@ def build_agent_graph(tools):
     builder.add_conditional_edges("agent", router)
     builder.add_edge("action", "agent")
 
-    return builder.compile(checkpointer=memory, interrupt_before=["action"])
+    # Use the passed-in async checkpointer
+    return builder.compile(checkpointer=checkpointer, interrupt_before=["action"])
 
-# --- MAIN EXECUTION ---
+# --- MAIN ---
 async def main():
     print("🛰️ Connecting to MCP and building tools...")
     tools = await create_mcp_tools()
-    graph = build_agent_graph(tools)
-    config = {"configurable": {"thread_id": "sre_session_1"}}
 
-    # Handle Telegram Approval Buttons
-    @bot.callback_query_handler(func=lambda call: True)
-    async def handle_query(call):
-        if call.data == "approve":
-            await bot.answer_callback_query(call.id, "Executing fix...")
-            # RESUME: We invoke with None to continue from the breakpoint
-            async for event in graph.astream(None, config):
-                print(f"Graph Resumed: {event}")
-        else:
-            await bot.answer_callback_query(call.id, "Action cancelled by human.")
+    # 1. Initialize the Async Checkpointer using the context manager
+    async with AsyncSqliteSaver.from_conn_string("/app/data/agent_state.db") as saver:
 
-    # 1. Start the monitoring loop
-    initial_input = {"messages": [HumanMessage(content="Scan the cluster for issues.")]}
+        # 2. Build graph with the async saver
+        graph = build_agent_graph(tools, saver)
+        config = {"configurable": {"thread_id": "sre_session_1"}}
 
-    async for event in graph.astream(initial_input, config):
-        # If the graph stops at the interrupt, this will trigger
-        if "__interrupt__" in event:
-            await ask_human(graph.get_state(config).values)
+        # Telegram callback remains async
+        @bot.callback_query_handler(func=lambda call: True)
+        async def handle_query(call):
+            if call.data == "approve":
+                await bot.answer_callback_query(call.id, "Executing fix...")
+                # Use the 'saver' context to resume
+                async for event in graph.astream(None, config):
+                    print(f"Graph Resumed: {event}")
+            else:
+                await bot.answer_callback_query(call.id, "Action cancelled.")
 
-    # 2. Start Telegram Polling (Non-blocking)
-    print("🤖 Agent and Bot are online!")
-    await bot.polling()
+        # 3. Start the initial monitoring run
+        initial_input = {"messages": [HumanMessage(content="Scan the cluster for issues.")]}
+
+        async for event in graph.astream(initial_input, config):
+            if "__interrupt__" in event:
+                # Retrieve state to send to Telegram
+                state = await graph.aget_state(config)
+                await ask_human(state.values)
+
+        print("🤖 Agent and Bot are online!")
+        await bot.polling()
 
 
 if __name__ == "__main__":
