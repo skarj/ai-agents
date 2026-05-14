@@ -53,14 +53,8 @@ async def fetch_mcp_tools():
             for t in mcp_tools.tools:
                 def create_tool_fn(t_name=t.name):
                     async def func(**kwargs):
-                        # Extract arguments from LangChain's wrapper
+                        # Extract arguments from wrapper
                         actual_args = kwargs.get('v__args', kwargs)
-
-                        # Fallback for missing namespace: default to ai-agents
-                        if "namespace" in t.inputSchema.get("required", []) and "namespace" not in actual_args:
-                            logger.info(f"⚠️ Missing required namespace in {t_name}, defaulting to 'ai-agents'")
-                            actual_args["namespace"] = "ai-agents"
-
                         logger.info(f"🛠️ MCP CALL: {t_name} with {actual_args}")
                         try:
                             async with sse_client(MCP_URL) as (r, w):
@@ -68,7 +62,7 @@ async def fetch_mcp_tools():
                                     await sess.initialize()
                                     res = await sess.call_tool(t_name, actual_args)
 
-                                    # Handle MCP TextContent format specifically to give clean text back to LLM
+                                    # Handle MCP TextContent format specifically
                                     if hasattr(res, 'content') and isinstance(res.content, list):
                                         return "\n".join([item.text for item in res.content if hasattr(item, 'text')])
                                     return str(res)
@@ -100,12 +94,17 @@ async def call_model(state: AgentState, tools_for_ollama: list):
     """Feeds the cluster state to the LLM and retrieves the next action."""
     formatted_messages = []
 
-    # Prepend a system message if not present to guide the agent
+    # System Prompt defining the autonomous SRE persona
+    system_prompt = (
+        "You are an autonomous Kubernetes SRE Agent. Your goal is to ensure cluster health. "
+        "You have full authority to explore the cluster. If you don't know which namespaces exist, "
+        "use your tools to list them. If a tool fails because of a missing parameter, "
+        "analyze the error and call the appropriate tool to find the missing information. "
+        "Do not ask the human for basic parameters like namespace names; discover them yourself."
+    )
+
     if not any(isinstance(m, SystemMessage) for m in state['messages']):
-        formatted_messages.append({
-            "role": "system",
-            "content": "You are a Kubernetes SRE. When asked to check pods or health, focus on the 'ai-agents' namespace unless told otherwise. If a tool requires a namespace and you are unsure, use 'ai-agents'. Always call tools to verify facts before reporting."
-        })
+        formatted_messages.append({"role": "system", "content": system_prompt})
 
     for m in state['messages']:
         if isinstance(m, HumanMessage): role = "user"
@@ -132,18 +131,15 @@ async def call_model(state: AgentState, tools_for_ollama: list):
 
         tool_calls = []
         for tc in raw_tool_calls:
-            if hasattr(tc, 'function'):
-                tool_calls.append({
-                    "name": tc.function.name,
-                    "args": tc.function.arguments,
-                    "id": getattr(tc, 'id', f"call_{tc.function.name}")
-                })
-            elif isinstance(tc, dict) and 'function' in tc:
-                tool_calls.append({
-                    "name": tc['function'].get('name'),
-                    "args": tc['function'].get('arguments'),
-                    "id": tc.get('id', f"call_{tc['function'].get('name')}")
-                })
+            t_name = tc.function.name if hasattr(tc, 'function') else tc['function'].get('name')
+            t_args = tc.function.arguments if hasattr(tc, 'function') else tc['function'].get('arguments')
+            t_id = getattr(tc, 'id', f"call_{t_name}")
+
+            tool_calls.append({
+                "name": t_name,
+                "args": t_args,
+                "id": t_id
+            })
 
         return {"messages": [AIMessage(content=content, tool_calls=tool_calls)]}
     except Exception as e:
@@ -183,20 +179,23 @@ async def notify_telegram(event):
 
     if isinstance(last_msg, AIMessage):
         if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
-            t_names = [tc.get('name', 'unknown') for tc in last_msg.tool_calls]
+            calls_info = []
+            for tc in last_msg.tool_calls:
+                name = tc.get('name', 'unknown')
+                args = tc.get('args', {})
+                calls_info.append(f"`{name}`(args: `{args}`)")
+
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("✅ Approve Execution", callback_data="approve"))
             markup.add(InlineKeyboardButton("❌ Reject", callback_data="reject"))
 
-            # Show reasoning or fallback text
-            reasoning = last_msg.content or "The agent is initiating a diagnostics step."
-            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Reasoning:** {reasoning}\n\n**Tools to run:** `{t_names}`"
+            reasoning = last_msg.content or "The agent is initiating cluster diagnostics."
+            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Reasoning:** {reasoning}\n\n**Calls:**\n" + "\n".join(calls_info)
             await bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="Markdown")
         elif last_msg.content:
             await bot.send_message(CHAT_ID, f"ℹ️ **Agent Report:**\n{last_msg.content}")
 
     elif isinstance(last_msg, ToolMessage):
-        # Truncate and clean up the result for Telegram
         output_text = str(last_msg.content)
         short_res = output_text[:800] + ("..." if len(output_text) > 800 else "")
         await bot.send_message(CHAT_ID, f"📦 **Tool Output:**\n```\n{short_res}\n```", parse_mode="Markdown")
@@ -226,8 +225,9 @@ async def main():
                 await bot.answer_callback_query(call.id, "Aborted.")
                 await bot.send_message(CHAT_ID, "🛑 **Manual Override:** Action cancelled.")
 
-        logger.info("🔍 Performing initial cluster health check...")
-        prompt = "Review the 'ai-agents' namespace. Identify any pods not in 'Running' state. Propose and execute fixes only after approval."
+        logger.info("🔍 Initiating autonomous health check...")
+        # The prompt is now high-level, forcing the AI to explore
+        prompt = "Perform a comprehensive health check of the entire cluster. Identify any issues and propose fixes."
         initial_input = {"messages": [HumanMessage(content=prompt)]}
 
         async for event in graph.astream(initial_input, config, stream_mode="values"):
