@@ -28,7 +28,7 @@ MCP_URL = os.getenv("MCP_URL", "http://mcp-k8s:8080/sse")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-MODEL = os.getenv("MODEL", "qwen3.6:27b")
+MODEL = os.getenv("MODEL", "qwen2.5:14b")
 DB_PATH = "agent_state.db"
 
 bot = AsyncTeleBot(TG_TOKEN)
