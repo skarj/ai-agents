@@ -227,7 +227,7 @@ async def main():
 
         logger.info("🔍 Initiating autonomous health check...")
         # The prompt is now high-level, forcing the AI to explore
-        prompt = "Perform a comprehensive health check of the entire cluster. Identify any issues and propose fixes."
+        prompt = "Perform a comprehensive health check of the entire cluster. Identify any issues and try to resolve them."
         initial_input = {"messages": [HumanMessage(content=prompt)]}
 
         async for event in graph.astream(initial_input, config, stream_mode="values"):
@@ -235,6 +235,7 @@ async def main():
 
         logger.info("🤖 System Idle. Waiting for Telegram or Kubernetes events...")
         await bot.polling(non_stop=True, interval=3, timeout=30)
+
 
 if __name__ == "__main__":
     try:
