@@ -146,8 +146,17 @@ async def main():
 
         logger.info("🤖 Agent Online. Monitoring Cluster...")
 
-        # Background initial scan
-        initial_input = {"messages": [HumanMessage(content="Scan cluster for health issues and propose fixes.")]}
+        initial_input = {
+            "messages": [
+                HumanMessage(content=(
+                    "You are a Senior SRE for a Raspberry Pi Cluster. "
+                    "1. List all pods in 'ai-agents' namespace. "
+                    "2. For any pod not in 'Running' state, get the logs and describe it. "
+                    "3. If it is an ImagePull error, propose the correct image name. "
+                    "4. If it is a CrashLoop, analyze the logs and propose a config fix."
+                ))
+            ]
+        }
 
         async def run_initial_scan():
             logger.info("🏃 Starting Initial Scan Stream...")
