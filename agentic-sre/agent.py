@@ -10,7 +10,7 @@ from langgraph.prebuilt import ToolNode
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.tools import StructuredTool
 from telebot.async_telebot import AsyncTeleBot
-from langgraph_checkpoint_sqlite import AsyncSqliteSaver
+from langgraph.checkpoint.sqlite import AsyncSqliteSaver
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
