@@ -91,9 +91,7 @@ async def call_model(state: AgentState, tools_for_ollama: list):
         else: role = "assistant"
 
         msg_obj = {"role": role, "content": m.content}
-        # Pass tool results back as specific role objects
         if isinstance(m, ToolMessage):
-            # Ensure the tool_call_id is preserved so the LLM can link result to request
             msg_obj["tool_call_id"] = getattr(m, 'tool_call_id', None)
         formatted_messages.append(msg_obj)
 
@@ -107,11 +105,25 @@ async def call_model(state: AgentState, tools_for_ollama: list):
 
         msg = response['message']
         content = msg.get('content', '')
-        tool_calls = msg.get('tool_calls', [])
+        raw_tool_calls = msg.get('tool_calls', [])
+
+        # Convert Ollama ToolCall objects to standard dicts for LangChain compatibility
+        tool_calls = []
+        for tc in raw_tool_calls:
+            # Handle cases where tc might be an object with .function attribute or a dict
+            if hasattr(tc, 'function'):
+                tool_calls.append({
+                    "name": tc.function.name,
+                    "args": tc.function.arguments,
+                    "id": getattr(tc, 'id', f"call_{tc.function.name}")
+                })
+            else:
+                # Fallback if it's already a dict or formatted differently
+                tool_calls.append(tc)
 
         return {"messages": [AIMessage(content=content, tool_calls=tool_calls)]}
     except Exception as e:
-        logger.error(f"❌ LLM Error: {e}")
+        logger.error(f"❌ LLM Error: {e}", exc_info=True)
         return {"messages": [AIMessage(content=f"Error contacting LLM provider: {str(e)}")]}
 
 # --- GRAPH ORCHESTRATION ---
@@ -126,7 +138,6 @@ def build_sre_graph(tools_list, tools_for_ollama, saver):
 
     workflow.set_entry_point("agent")
 
-    # Routing logic: Action (Tool) or End (Talk to Human)
     def should_continue(state):
         last_message = state["messages"][-1]
         if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
@@ -136,7 +147,6 @@ def build_sre_graph(tools_list, tools_for_ollama, saver):
     workflow.add_conditional_edges("agent", should_continue)
     workflow.add_edge("action", "agent")
 
-    # HITL: Always stop before the cluster is modified
     return workflow.compile(checkpointer=saver, interrupt_before=["action"])
 
 # --- TELEGRAM COMMUNICATION ---
@@ -147,10 +157,9 @@ async def notify_telegram(event):
 
     last_msg = event["messages"][-1]
 
-    # 1. AI wants to perform an action
     if isinstance(last_msg, AIMessage):
         if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
-            t_names = [tc['function']['name'] for tc in last_msg.tool_calls]
+            t_names = [tc.get('name', 'unknown') for tc in last_msg.tool_calls]
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("✅ Approve Execution", callback_data="approve"))
             markup.add(InlineKeyboardButton("❌ Reject", callback_data="reject"))
@@ -158,12 +167,9 @@ async def notify_telegram(event):
             text = f"🚨 **SRE ACTION REQUIRED**\n\n**Proposal:** {last_msg.content}\n\n**Tools to run:** `{t_names}`"
             await bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="Markdown")
         elif last_msg.content:
-            # AI is just providing information
             await bot.send_message(CHAT_ID, f"ℹ️ **Agent Report:**\n{last_msg.content}")
 
-    # 2. A tool just finished running
     elif isinstance(last_msg, ToolMessage):
-        # Truncate long outputs for readability
         short_res = last_msg.content[:800] + ("..." if len(last_msg.content) > 800 else "")
         await bot.send_message(CHAT_ID, f"📦 **Tool Output:**\n```\n{short_res}\n```", parse_mode="Markdown")
 
@@ -182,19 +188,16 @@ async def main():
         graph = build_sre_graph(tools_list, tools_for_ollama, saver)
         config = {"configurable": {"thread_id": "sre_prod_v1"}}
 
-        # Handle button clicks
         @bot.callback_query_handler(func=lambda call: True)
         async def handle_approval(call):
             if call.data == "approve":
                 await bot.answer_callback_query(call.id, "Executing...")
-                # RESUME the graph: passing None indicates continuing from the interrupt
                 async for event in graph.astream(None, config, stream_mode="values"):
                     await notify_telegram(event)
             else:
                 await bot.answer_callback_query(call.id, "Aborted.")
                 await bot.send_message(CHAT_ID, "🛑 **Manual Override:** Action cancelled.")
 
-        # Initial Scan
         logger.info("🔍 Performing initial cluster health check...")
         prompt = "Review the ai-agents namespace. If any pod is not Running, use your tools to troubleshoot and propose a fix."
         initial_input = {"messages": [HumanMessage(content=prompt)]}
