@@ -15,7 +15,7 @@ from telebot.async_telebot import AsyncTeleBot
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- LOGGING ---
+# --- LOGGING CONFIGURATION ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -23,155 +23,182 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- CONFIG ---
+# --- ENVIRONMENT CONFIG ---
 MCP_URL = os.getenv("MCP_URL", "http://mcp-k8s:8080/sse")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MODEL = os.getenv("MODEL", "qwen2.5:14b")
-DB_PATH = "agent_state.db"
+DB_PATH = "/app/data/agent_state.db"
 
+# --- GLOBAL CLIENTS ---
 bot = AsyncTeleBot(TG_TOKEN)
-# Set a timeout for Ollama so we don't hang forever
-ollama_client = AsyncClient(host=OLLAMA_URL, timeout=120.0)
+ollama_client = AsyncClient(host=OLLAMA_URL, timeout=180.0)
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], "The conversation history"]
 
-# --- DYNAMIC MCP TOOL BUILDER ---
-async def create_mcp_tools():
+# --- DYNAMIC MCP TOOL DISCOVERY ---
+async def fetch_mcp_tools():
+    logger.info(f"🔗 Connecting to MCP at {MCP_URL}...")
     async with sse_client(MCP_URL) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             mcp_tools = await session.list_tools()
 
-            tools = []
-            for t in mcp_tools.tools:
-                def create_fn(tool_name):
-                    async def func(args: dict):
-                        logger.info(f"🛠️ Executing Tool: {tool_name} with args: {args}")
-                        async with sse_client(MCP_URL) as (r, w):
-                            async with ClientSession(r, w) as sess:
-                                await sess.initialize()
-                                res = await sess.call_tool(tool_name, args)
-                                logger.info(f"✅ Tool {tool_name} returned result.")
-                                return str(res.content)
-                    return func
+            tools_list = []
+            ollama_format_tools = []
 
-                tools.append(StructuredTool.from_function(
-                    coroutine=create_fn(t.name),
+            for t in mcp_tools.tools:
+                # 1. Create the executable function for LangGraph
+                async def create_tool_fn(args: dict, t_name=t.name):
+                    logger.info(f"🛠️ MCP CALL: {t_name} with {args}")
+                    async with sse_client(MCP_URL) as (r, w):
+                        async with ClientSession(r, w) as sess:
+                            await sess.initialize()
+                            res = await sess.call_tool(t_name, args)
+                            return str(res.content)
+
+                # 2. Add to LangChain StructuredTool list
+                tools_list.append(StructuredTool.from_function(
+                    coroutine=create_tool_fn,
                     name=t.name,
                     description=t.description
                 ))
-            return tools
 
-# --- AGENT LOGIC ---
-async def call_model(state: AgentState):
-    messages = []
+                # 3. Format for Ollama's tool-calling API
+                ollama_format_tools.append({
+                    'type': 'function',
+                    'function': {
+                        'name': t.name,
+                        'description': t.description,
+                        'parameters': t.inputSchema
+                    }
+                })
+
+            return tools_list, ollama_format_tools
+
+# --- AI REASONING NODE ---
+async def call_model(state: AgentState, tools_for_ollama: list):
+    formatted_messages = []
     for m in state['messages']:
-        role = "user" if isinstance(m, HumanMessage) else "assistant"
-        if isinstance(m, ToolMessage): role = "tool"
-        messages.append({"role": role, "content": m.content})
+        if isinstance(m, HumanMessage): role = "user"
+        elif isinstance(m, ToolMessage): role = "tool"
+        else: role = "assistant"
 
-    logger.info(f"🧠 Calling Ollama model: {MODEL}...")
+        msg_obj = {"role": role, "content": m.content}
+
+        if isinstance(m, ToolMessage):
+            msg_obj["tool_call_id"] = m.tool_call_id
+        formatted_messages.append(msg_obj)
+
+    logger.info(f"🧠 Asking {MODEL} for next steps...")
     try:
-        response = await ollama_client.chat(model=MODEL, messages=messages)
-        content = response['message'].get('content', "")
-        logger.info("📡 Ollama responded successfully.")
-        return {"messages": [AIMessage(content=content)]}
+        response = await ollama_client.chat(
+            model=MODEL,
+            messages=formatted_messages,
+            tools=tools_for_ollama
+        )
+
+        msg = response['message']
+        content = msg.get('content', '')
+        tool_calls = msg.get('tool_calls', [])
+
+        return {"messages": [AIMessage(content=content, tool_calls=tool_calls)]}
     except Exception as e:
-        logger.error(f"❌ Ollama Chat Error: {e}")
-        return {"messages": [AIMessage(content=f"Error: Model is unresponsive. {str(e)}")]}
+        logger.error(f"❌ Ollama Error: {e}")
+        return {"messages": [AIMessage(content=f"Error contacting Mac GPU: {str(e)}")]}
 
-# --- GRAPH BUILDER ---
-def build_agent_graph(tools, checkpointer):
-    builder = StateGraph(AgentState)
-    builder.add_node("agent", call_model)
-    builder.add_node("action", ToolNode(tools))
-    builder.set_entry_point("agent")
+# --- GRAPH ORCHESTRATION ---
+def build_sre_graph(tools_list, tools_for_ollama, saver):
+    workflow = StateGraph(AgentState)
 
-    def router(state):
+    # Define nodes
+    workflow.add_node("agent", lambda state: call_model(state, tools_for_ollama))
+    workflow.add_node("action", ToolNode(tools_list))
+
+    workflow.set_entry_point("agent")
+
+    # Routing logic: Action (Tool) or End (Talk to Human)
+    def should_continue(state):
         last_message = state["messages"][-1]
         if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-            logger.info("↪️ Router: Moving to Action (Tool Call)")
             return "action"
-        logger.info("↪️ Router: Ending conversation/Wait for Human")
         return END
 
-    builder.add_conditional_edges("agent", router)
-    builder.add_edge("action", "agent")
-    return builder.compile(checkpointer=checkpointer, interrupt_before=["action"])
+    workflow.add_conditional_edges("agent", should_continue)
+    workflow.add_edge("action", "agent")
 
-# --- TELEGRAM LOGIC ---
-async def process_graph_event(event):
-    if "messages" in event:
-        last_msg = event["messages"][-1]
-        if isinstance(last_msg, AIMessage) and last_msg.content:
-            logger.info(f"📤 Sending update to Telegram (Chat ID: {CHAT_ID})")
-            if any(kw in last_msg.content.lower() for kw in ["propose", "fix", "execute", "plan"]):
-                markup = InlineKeyboardMarkup()
-                markup.add(InlineKeyboardButton("✅ Approve", callback_data="approve"))
-                markup.add(InlineKeyboardButton("❌ Reject", callback_data="reject"))
-                await bot.send_message(CHAT_ID, f"🚨 **SRE PROPOSAL:**\n\n{last_msg.content}",
-                                     reply_markup=markup, parse_mode="Markdown")
-            else:
-                await bot.send_message(CHAT_ID, f"ℹ️ {last_msg.content}")
+    # HITL: Always stop before the cluster is modified
+    return workflow.compile(checkpointer=saver, interrupt_before=["action"])
 
-def register_bot_handlers(graph, config):
-    @bot.callback_query_handler(func=lambda call: True)
-    async def handle_query(call):
-        logger.info(f"📥 Received Telegram Callback: {call.data}")
-        if call.data == "approve":
-            await bot.answer_callback_query(call.id, "Executing Action...")
-            async for event in graph.astream(None, config, stream_mode="values"):
-                await process_graph_event(event)
-        else:
-            await bot.answer_callback_query(call.id, "Action Rejected.")
-            await bot.send_message(CHAT_ID, "Manual Override: Action Aborted.")
+# --- TELEGRAM COMMUNICATION ---
+async def notify_telegram(event):
+    """Processes graph updates and sends meaningful alerts to Telegram."""
+    if "messages" not in event:
+        return
 
-# --- MAIN RUNNER ---
+    last_msg = event["messages"][-1]
+
+    # 1. AI wants to perform an action
+    if isinstance(last_msg, AIMessage):
+        if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+            t_names = [tc['function']['name'] for tc in last_msg.tool_calls]
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("✅ Approve Execution", callback_data="approve"))
+            markup.add(InlineKeyboardButton("❌ Reject", callback_data="reject"))
+
+            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Proposal:** {last_msg.content}\n\n**Tools to run:** `{t_names}`"
+            await bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="Markdown")
+        elif last_msg.content:
+            # AI is just providing information
+            await bot.send_message(CHAT_ID, f"ℹ️ **Agent Report:**\n{last_msg.content}")
+
+    # 2. A tool just finished running
+    elif isinstance(last_msg, ToolMessage):
+        # We truncate long K8s logs/outputs for Telegram readability
+        short_res = last_msg.content[:800] + ("..." if len(last_msg.content) > 800 else "")
+        await bot.send_message(CHAT_ID, f"📦 **Tool Output:**\n```\n{short_res}\n```", parse_mode="Markdown")
+
+# --- MAIN LOOP ---
 async def main():
-    logger.info("🛰️ Initializing MCP Connection...")
+    logger.info("🚀 Starting Agentic SRE Node...")
+
     try:
-        tools = await create_mcp_tools()
-        logger.info(f"✅ Loaded {len(tools)} tools.")
+        tools_list, tools_for_ollama = await fetch_mcp_tools()
+        logger.info(f"✅ Discovered {len(tools_list)} cluster tools.")
     except Exception as e:
-        logger.error(f"❌ MCP Connection Error: {e}")
+        logger.error(f"❌ Failed to initialize MCP tools: {e}")
         return
 
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as saver:
-        graph = build_agent_graph(tools, saver)
-        config = {"configurable": {"thread_id": "sre_session_1"}}
-        register_bot_handlers(graph, config)
+        graph = build_sre_graph(tools_list, tools_for_ollama, saver)
+        config = {"configurable": {"thread_id": "sre_prod_v1"}}
 
-        logger.info("🤖 Agent Online. Monitoring Cluster...")
+        # Handle button clicks
+        @bot.callback_query_handler(func=lambda call: True)
+        async def handle_approval(call):
+            if call.data == "approve":
+                await bot.answer_callback_query(call.id, "Executing...")
+                async for event in graph.astream(None, config, stream_mode="values"):
+                    await notify_telegram(event)
+            else:
+                await bot.answer_callback_query(call.id, "Aborted.")
+                await bot.send_message(CHAT_ID, "🛑 **Manual Override:** Action cancelled.")
 
-        initial_input = {
-            "messages": [
-                HumanMessage(content=(
-                    "You are a Senior SRE for a Raspberry Pi Cluster. "
-                    "1. List all pods in 'ai-agents' namespace. "
-                    "2. For any pod not in 'Running' state, get the logs and describe it. "
-                    "3. If it is an ImagePull error, propose the correct image name. "
-                    "4. If it is a CrashLoop, analyze the logs and propose a config fix."
-                ))
-            ]
-        }
+        # Initial Scan
+        logger.info("🔍 Performing initial cluster health check...")
+        prompt = "Review the ai-agents namespace. If any pod is not Running, use your tools to troubleshoot and propose a fix."
+        initial_input = {"messages": [HumanMessage(content=prompt)]}
 
-        async def run_initial_scan():
-            logger.info("🏃 Starting Initial Scan Stream...")
-            async for event in graph.astream(initial_input, config, stream_mode="values"):
-                await process_graph_event(event)
-            logger.info("🏁 Initial Scan Stream Finished.")
+        async for event in graph.astream(initial_input, config, stream_mode="values"):
+            await notify_telegram(event)
 
-        # Gather both polling and scan
-        await asyncio.gather(
-            bot.polling(non_stop=True, skip_pending=True, timeout=90),
-            run_initial_scan()
-        )
+        logger.info("🤖 System Idle. Waiting for Telegram or K8s events...")
+        await bot.polling(non_stop=True)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("👋 Shutdown initiated.")
+        logger.info("👋 Shutdown requested.")
