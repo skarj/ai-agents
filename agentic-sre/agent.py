@@ -51,25 +51,27 @@ async def fetch_mcp_tools():
             ollama_format_tools = []
 
             for t in mcp_tools.tools:
-                # 1. Create the executable function for LangGraph
                 def create_tool_fn(t_name=t.name):
-                    async def func(args: dict):
-                        logger.info(f"🛠️ MCP CALL: {t_name} with {args}")
-                        async with sse_client(MCP_URL) as (r, w):
-                            async with ClientSession(r, w) as sess:
-                                await sess.initialize()
-                                res = await sess.call_tool(t_name, args)
-                                return str(res.content)
+                    async def func(**kwargs):
+                        actual_args = kwargs.get('v__args', kwargs)
+                        logger.info(f"🛠️ MCP CALL: {t_name} with {actual_args}")
+                        try:
+                            async with sse_client(MCP_URL) as (r, w):
+                                async with ClientSession(r, w) as sess:
+                                    await sess.initialize()
+                                    res = await sess.call_tool(t_name, actual_args)
+                                    return str(res.content)
+                        except Exception as e:
+                            logger.error(f"❌ MCP Tool Execution Error ({t_name}): {e}")
+                            return f"Error executing {t_name}: {str(e)}"
                     return func
 
-                # 2. Add to LangChain StructuredTool list
                 tools_list.append(StructuredTool.from_function(
                     coroutine=create_tool_fn(t.name),
                     name=t.name,
                     description=t.description
                 ))
 
-                # 3. Format for Ollama's tool-calling API
                 ollama_format_tools.append({
                     'type': 'function',
                     'function': {
@@ -107,10 +109,8 @@ async def call_model(state: AgentState, tools_for_ollama: list):
         content = msg.get('content', '')
         raw_tool_calls = msg.get('tool_calls', [])
 
-        # Convert Ollama ToolCall objects to standard dicts for LangChain compatibility
         tool_calls = []
         for tc in raw_tool_calls:
-            # Handle cases where tc might be an object with .function attribute or a dict
             if hasattr(tc, 'function'):
                 tool_calls.append({
                     "name": tc.function.name,
@@ -118,12 +118,11 @@ async def call_model(state: AgentState, tools_for_ollama: list):
                     "id": getattr(tc, 'id', f"call_{tc.function.name}")
                 })
             else:
-                # Fallback if it's already a dict or formatted differently
                 tool_calls.append(tc)
 
         return {"messages": [AIMessage(content=content, tool_calls=tool_calls)]}
     except Exception as e:
-        logger.error(f"❌ LLM Error: {e}", exc_info=True)
+        logger.error(f"❌ LLM Error: {e}")
         return {"messages": [AIMessage(content=f"Error contacting LLM provider: {str(e)}")]}
 
 # --- GRAPH ORCHESTRATION ---
@@ -170,6 +169,7 @@ async def notify_telegram(event):
             await bot.send_message(CHAT_ID, f"ℹ️ **Agent Report:**\n{last_msg.content}")
 
     elif isinstance(last_msg, ToolMessage):
+        # Result of execution
         short_res = last_msg.content[:800] + ("..." if len(last_msg.content) > 800 else "")
         await bot.send_message(CHAT_ID, f"📦 **Tool Output:**\n```\n{short_res}\n```", parse_mode="Markdown")
 
@@ -192,6 +192,7 @@ async def main():
         async def handle_approval(call):
             if call.data == "approve":
                 await bot.answer_callback_query(call.id, "Executing...")
+                # Stream the resumption
                 async for event in graph.astream(None, config, stream_mode="values"):
                     await notify_telegram(event)
             else:
@@ -206,7 +207,8 @@ async def main():
             await notify_telegram(event)
 
         logger.info("🤖 System Idle. Waiting for Telegram or Kubernetes events...")
-        await bot.polling(non_stop=True)
+        # Add non_stop and retry_on_error to handle the 409 Conflict gracefully
+        await bot.polling(non_stop=True, interval=2, timeout=20)
 
 if __name__ == "__main__":
     try:
