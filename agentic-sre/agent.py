@@ -10,8 +10,8 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain_core.tools import tool
-import telebot
+from langchain_core.tools import tool, StructuredTool
+from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
@@ -21,100 +21,109 @@ TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MODEL = "qwen3.6:27b"
 
-bot = telebot.TeleBot(TG_TOKEN)
+bot = AsyncTeleBot(TG_TOKEN)
 
-# --- STATE DEFINITION ---
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], "The conversation history"]
 
-# --- MCP TOOL BRIDGE ---
-async def get_mcp_tools():
-    """Fetch tools from the MCP server and wrap them for LangGraph"""
+# --- DYNAMIC MCP TOOL BUILDER ---
+async def create_mcp_tools():
+    """
+    Connects to MCP and builds real executable tools.
+    We use StructuredTool.from_function because it handles dynamic naming better than the decorator.
+    """
     async with sse_client(MCP_URL) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             mcp_tools = await session.list_tools()
 
-            # Helper to wrap MCP tools into LangChain tools
-            def create_tool(mcp_t):
-                @tool(name=mcp_t.name)
-                def k8s_tool(args: dict):
-                    # In a real setup, this would call session.call_tool
-                    # For this script, we return the plan for user approval
-                    return f"Plan to execute {mcp_t.name} with {args}"
-                k8s_tool.description = mcp_t.description
-                return k8s_tool
+            tools = []
+            for t in mcp_tools.tools:
+                async def tool_wrapper(args: dict, mcp_tool_name=t.name):
+                    async with sse_client(MCP_URL) as (r, w):
+                        async with ClientSession(r, w) as sess:
+                            await sess.initialize()
+                            result = await sess.call_tool(mcp_tool_name, args)
+                            return str(result.content)
 
-            return [create_tool(t) for t in mcp_tools.tools]
+                tools.append(StructuredTool.from_function(
+                    coroutine=tool_wrapper,
+                    name=t.name,
+                    description=t.description
+                ))
+            return tools
 
 # --- AGENT LOGIC ---
-def call_model(state: AgentState):
+async def call_model(state: AgentState):
     messages = state['messages']
-    response = ollama.chat(
+    response = await asyncio.to_thread(
+        ollama.chat,
         model=MODEL,
         messages=[{"role": m.type, "content": m.content} for m in messages],
         host=OLLAMA_URL,
-        options={'think': False}
+        options={'think': False} # Disabling internal chain-of-thought for speed
     )
     return {"messages": [AIMessage(content=response['message']['content'])]}
 
-# --- HUMAN IN THE LOOP (TELEGRAM) ---
-def ask_human_via_telegram(state: AgentState):
+# --- HUMAN IN THE LOOP ---
+async def ask_human(state: AgentState):
     last_message = state['messages'][-1].content
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ Approve", callback_data="approve"))
     markup.add(InlineKeyboardButton("❌ Reject", callback_data="reject"))
 
-    bot.send_message(CHAT_ID, f"🤖 **AI PROPOSAL:**\n\n{last_message}", reply_markup=markup, parse_mode="Markdown")
-    print("Waiting for Telegram approval...")
+    await bot.send_message(CHAT_ID, f"🚨 **SRE PROPOSAL:**\n\n{last_message}", reply_markup=markup, parse_mode="Markdown")
 
-# --- GRAPH CONSTRUCTION ---
-def build_graph(tools):
-    # Persistence for HITL
+# --- GRAPH BUILDER ---
+def build_agent_graph(tools):
     memory = SqliteSaver(sqlite3.connect("/app/data/agent_state.db", check_same_thread=False))
 
-    workflow = StateGraph(AgentState)
-    workflow.add_node("agent", call_model)
-    workflow.add_node("action", ToolNode(tools))
+    builder = StateGraph(AgentState)
+    builder.add_node("agent", call_model)
+    builder.add_node("action", ToolNode(tools))
 
-    workflow.set_entry_point("agent")
+    builder.set_entry_point("agent")
 
-    # Interrupt before 'action' node
-    graph = workflow.compile(
-        checkpointer=memory,
-        interrupt_before=["action"]
-    )
-    return graph
+    # Logic: If agent suggests a tool, we interrupt. If it just talks, we end.
+    def router(state):
+        if state["messages"][-1].additional_kwargs.get("tool_calls"):
+            return "action"
+        return END
 
-# --- TELEGRAM CALLBACK HANDLER ---
-# This listens for your click and "resumes" the graph
-async def run_bot_loop(graph, config):
-    @bot.callback_query_handler(func=lambda call: True)
-    def callback_query(call):
-        if call.data == "approve":
-            bot.answer_callback_query(call.id, "Action Approved!")
-            # Resume the graph
-            asyncio.run(graph.ainvoke(None, config))
-        else:
-            bot.answer_callback_query(call.id, "Action Cancelled.")
+    builder.add_conditional_edges("agent", router)
+    builder.add_edge("action", "agent")
 
-    bot.infinity_polling()
+    return builder.compile(checkpointer=memory, interrupt_before=["action"])
 
-
+# --- MAIN EXECUTION ---
 async def main():
-    tools = await get_mcp_tools()
-    graph = build_graph(tools)
+    print("🛰️ Connecting to MCP and building tools...")
+    tools = await create_mcp_tools()
+    graph = build_agent_graph(tools)
     config = {"configurable": {"thread_id": "sre_session_1"}}
 
-    # Start the initial run
-    initial_input = {"messages": [HumanMessage(content="Check for crashing pods and suggest a fix.")]}
-    async for event in graph.astream(initial_input, config):
-        for node, state in event.items():
-            if node == "agent":
-                ask_human_via_telegram(state)
+    # Handle Telegram Approval Buttons
+    @bot.callback_query_handler(func=lambda call: True)
+    async def handle_query(call):
+        if call.data == "approve":
+            await bot.answer_callback_query(call.id, "Executing fix...")
+            # RESUME: We invoke with None to continue from the breakpoint
+            async for event in graph.astream(None, config):
+                print(f"Graph Resumed: {event}")
+        else:
+            await bot.answer_callback_query(call.id, "Action cancelled by human.")
 
-    # Start Telegram listener
-    await run_bot_loop(graph, config)
+    # 1. Start the monitoring loop
+    initial_input = {"messages": [HumanMessage(content="Scan the cluster for issues.")]}
+
+    async for event in graph.astream(initial_input, config):
+        # If the graph stops at the interrupt, this will trigger
+        if "__interrupt__" in event:
+            await ask_human(graph.get_state(config).values)
+
+    # 2. Start Telegram Polling (Non-blocking)
+    print("🤖 Agent and Bot are online!")
+    await bot.polling()
 
 
 if __name__ == "__main__":
