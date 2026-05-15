@@ -2,6 +2,7 @@ import os
 import asyncio
 import sys
 import logging
+import json
 from typing import Annotated, TypedDict
 
 from ollama import AsyncClient
@@ -53,6 +54,7 @@ async def fetch_mcp_tools():
             for t in mcp_tools.tools:
                 def create_tool_fn(t_name=t.name):
                     async def func(**kwargs):
+                        # Fix: Handle LangChain wrapping arguments in v__args
                         actual_args = kwargs.get('v__args', kwargs)
                         logger.info(f"🛠️ MCP CALL: {t_name} with {actual_args}")
                         try:
@@ -61,6 +63,7 @@ async def fetch_mcp_tools():
                                     await sess.initialize()
                                     res = await sess.call_tool(t_name, actual_args)
 
+                                    # Extract clean text from MCP response objects
                                     if hasattr(res, 'content') and isinstance(res.content, list):
                                         return "\n".join([item.text for item in res.content if hasattr(item, 'text')])
                                     return str(res)
@@ -92,11 +95,14 @@ async def call_model(state: AgentState, tools_for_ollama: list):
     """Feeds the cluster state to the LLM and retrieves the next action."""
     formatted_messages = []
 
+    # Force the LLM to understand parameter requirements
     system_prompt = (
-        "You are an autonomous Kubernetes SRE Agent. Your goal is to ensure cluster health. "
-        "IMPORTANT: When you suggest a fix or a check, you MUST call the corresponding tool. "
-        "Do not just explain what you will do. If you propose an action, initiate the tool call immediately. "
-        "Use your tools to list namespaces, check pods, and read logs to find the root cause."
+        "You are an autonomous Kubernetes SRE Agent. "
+        "CRITICAL: When calling tools, you MUST provide all required parameters. "
+        "- For 'pods_list_in_namespace', you MUST provide the 'namespace'. "
+        "- For 'pods_get_logs', you MUST provide both 'name' and 'namespace'. "
+        "If you don't know the namespace, call 'list_namespaces' first. "
+        "Never guess parameters; discover them using your tools."
     )
 
     if not any(isinstance(m, SystemMessage) for m in state['messages']):
@@ -137,6 +143,14 @@ async def call_model(state: AgentState, tools_for_ollama: list):
         for tc in raw_tool_calls:
             t_name = tc.function.name if hasattr(tc, 'function') else tc['function'].get('name')
             t_args = tc.function.arguments if hasattr(tc, 'function') else tc['function'].get('arguments')
+
+            # Handle cases where Ollama returns arguments as a JSON string
+            if isinstance(t_args, str):
+                try:
+                    t_args = json.loads(t_args)
+                except:
+                    pass
+
             t_id = getattr(tc, 'id', f"call_{t_name}")
 
             tool_calls.append({
@@ -183,13 +197,18 @@ async def notify_telegram(event):
 
     if isinstance(last_msg, AIMessage):
         if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
-            calls_info = [f"`{tc['name']}`" for tc in last_msg.tool_calls]
+            calls_info = []
+            for tc in last_msg.tool_calls:
+                name = tc.get('name', 'unknown')
+                args = tc.get('args', {})
+                calls_info.append(f"`{name}` with args `{args}`")
+
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("✅ Approve Execution", callback_data="approve"))
             markup.add(InlineKeyboardButton("❌ Reject", callback_data="reject"))
 
             reasoning = last_msg.content or "The agent is initiating cluster diagnostics."
-            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Reasoning:** {reasoning}\n\n**Tools to run:** {', '.join(calls_info)}"
+            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Reasoning:** {reasoning}\n\n**Calls:**\n" + "\n".join(calls_info)
             await bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="Markdown")
         elif last_msg.content:
             await bot.send_message(CHAT_ID, f"ℹ️ **Agent Report:**\n{last_msg.content}")
@@ -214,7 +233,7 @@ async def main():
         graph = build_sre_graph(tools_list, tools_for_ollama, saver)
         config = {"configurable": {"thread_id": "sre_prod_v1"}}
 
-        # HANDLER: Button Clicks (Approve/Reject)
+        # HANDLER: Button Clicks
         @bot.callback_query_handler(func=lambda call: True)
         async def handle_approval(call):
             if call.data == "approve":
@@ -225,7 +244,7 @@ async def main():
                 await bot.answer_callback_query(call.id, "Aborted.")
                 await bot.send_message(CHAT_ID, "🛑 **Manual Override:** Action cancelled.")
 
-        # HANDLER: Direct User Messages (Interactive Mode)
+        # HANDLER: Direct User Messages
         @bot.message_handler(func=lambda message: str(message.chat.id) == str(CHAT_ID))
         async def handle_user_command(message):
             logger.info(f"👤 User Request: {message.text}")
@@ -233,7 +252,7 @@ async def main():
             async for event in graph.astream(user_input, config, stream_mode="values"):
                 await notify_telegram(event)
 
-        # Initial background scan on startup
+        # Initial background scan
         logger.info("🔍 Initiating autonomous health check...")
         initial_prompt = "Perform a comprehensive health check of the entire cluster. Identify issues and suggest fixes."
         initial_input = {"messages": [HumanMessage(content=initial_prompt)]}
@@ -241,7 +260,7 @@ async def main():
         async for event in graph.astream(initial_input, config, stream_mode="values"):
             await notify_telegram(event)
 
-        logger.info("🤖 Agent and Bot Online. You can now chat with the bot!")
+        logger.info("🤖 Agent and Bot Online.")
         await bot.polling(non_stop=True, interval=3, timeout=30)
 
 if __name__ == "__main__":
