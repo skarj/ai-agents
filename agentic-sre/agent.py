@@ -53,7 +53,6 @@ async def fetch_mcp_tools():
             for t in mcp_tools.tools:
                 def create_tool_fn(t_name=t.name):
                     async def func(**kwargs):
-                        # Extract arguments from wrapper
                         actual_args = kwargs.get('v__args', kwargs)
                         logger.info(f"🛠️ MCP CALL: {t_name} with {actual_args}")
                         try:
@@ -62,7 +61,6 @@ async def fetch_mcp_tools():
                                     await sess.initialize()
                                     res = await sess.call_tool(t_name, actual_args)
 
-                                    # Handle MCP TextContent format specifically
                                     if hasattr(res, 'content') and isinstance(res.content, list):
                                         return "\n".join([item.text for item in res.content if hasattr(item, 'text')])
                                     return str(res)
@@ -94,27 +92,33 @@ async def call_model(state: AgentState, tools_for_ollama: list):
     """Feeds the cluster state to the LLM and retrieves the next action."""
     formatted_messages = []
 
-    # System Prompt defining the autonomous SRE persona
     system_prompt = (
         "You are an autonomous Kubernetes SRE Agent. Your goal is to ensure cluster health. "
-        "You have full authority to explore the cluster. If you don't know which namespaces exist, "
-        "use your tools to list them. If a tool fails because of a missing parameter, "
-        "analyze the error and call the appropriate tool to find the missing information. "
-        "Do not ask the human for basic parameters like namespace names; discover them yourself."
+        "IMPORTANT: When you suggest a fix or a check, you MUST call the corresponding tool. "
+        "Do not just explain what you will do. If you propose an action, initiate the tool call immediately. "
+        "Use your tools to list namespaces, check pods, and read logs to find the root cause."
     )
 
     if not any(isinstance(m, SystemMessage) for m in state['messages']):
         formatted_messages.append({"role": "system", "content": system_prompt})
 
     for m in state['messages']:
-        if isinstance(m, HumanMessage): role = "user"
-        elif isinstance(m, ToolMessage): role = "tool"
+        role = "user"
+        if isinstance(m, ToolMessage): role = "tool"
         elif isinstance(m, SystemMessage): role = "system"
-        else: role = "assistant"
+        elif isinstance(m, AIMessage): role = "assistant"
+        else: role = "user"
 
         msg_obj = {"role": role, "content": m.content or ""}
-        if isinstance(m, ToolMessage):
-            msg_obj["tool_call_id"] = getattr(m, 'tool_call_id', None)
+        if isinstance(m, (AIMessage, ToolMessage)) and hasattr(m, 'tool_call_id'):
+            msg_obj["tool_call_id"] = m.tool_call_id
+
+        if isinstance(m, AIMessage) and m.tool_calls:
+             msg_obj["tool_calls"] = [
+                 {"type": "function", "function": {"name": tc["name"], "arguments": tc["args"]}}
+                 for tc in m.tool_calls
+             ]
+
         formatted_messages.append(msg_obj)
 
     logger.info(f"🧠 Asking {MODEL} for next steps...")
@@ -179,18 +183,13 @@ async def notify_telegram(event):
 
     if isinstance(last_msg, AIMessage):
         if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
-            calls_info = []
-            for tc in last_msg.tool_calls:
-                name = tc.get('name', 'unknown')
-                args = tc.get('args', {})
-                calls_info.append(f"`{name}`(args: `{args}`)")
-
+            calls_info = [f"`{tc['name']}`" for tc in last_msg.tool_calls]
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("✅ Approve Execution", callback_data="approve"))
             markup.add(InlineKeyboardButton("❌ Reject", callback_data="reject"))
 
             reasoning = last_msg.content or "The agent is initiating cluster diagnostics."
-            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Reasoning:** {reasoning}\n\n**Calls:**\n" + "\n".join(calls_info)
+            text = f"🚨 **SRE ACTION REQUIRED**\n\n**Reasoning:** {reasoning}\n\n**Tools to run:** {', '.join(calls_info)}"
             await bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="Markdown")
         elif last_msg.content:
             await bot.send_message(CHAT_ID, f"ℹ️ **Agent Report:**\n{last_msg.content}")
@@ -215,6 +214,7 @@ async def main():
         graph = build_sre_graph(tools_list, tools_for_ollama, saver)
         config = {"configurable": {"thread_id": "sre_prod_v1"}}
 
+        # HANDLER: Button Clicks (Approve/Reject)
         @bot.callback_query_handler(func=lambda call: True)
         async def handle_approval(call):
             if call.data == "approve":
@@ -225,17 +225,24 @@ async def main():
                 await bot.answer_callback_query(call.id, "Aborted.")
                 await bot.send_message(CHAT_ID, "🛑 **Manual Override:** Action cancelled.")
 
+        # HANDLER: Direct User Messages (Interactive Mode)
+        @bot.message_handler(func=lambda message: str(message.chat.id) == str(CHAT_ID))
+        async def handle_user_command(message):
+            logger.info(f"👤 User Request: {message.text}")
+            user_input = {"messages": [HumanMessage(content=message.text)]}
+            async for event in graph.astream(user_input, config, stream_mode="values"):
+                await notify_telegram(event)
+
+        # Initial background scan on startup
         logger.info("🔍 Initiating autonomous health check...")
-        # The prompt is now high-level, forcing the AI to explore
-        prompt = "Perform a comprehensive health check of the entire cluster. Identify any issues and try to resolve them."
-        initial_input = {"messages": [HumanMessage(content=prompt)]}
+        initial_prompt = "Perform a comprehensive health check of the entire cluster. Identify issues and suggest fixes."
+        initial_input = {"messages": [HumanMessage(content=initial_prompt)]}
 
         async for event in graph.astream(initial_input, config, stream_mode="values"):
             await notify_telegram(event)
 
-        logger.info("🤖 System Idle. Waiting for Telegram or Kubernetes events...")
+        logger.info("🤖 Agent and Bot Online. You can now chat with the bot!")
         await bot.polling(non_stop=True, interval=3, timeout=30)
-
 
 if __name__ == "__main__":
     try:
