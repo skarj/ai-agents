@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-agent
+  namespace: ai-agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sre-agent
+  template:
+    metadata:
+      labels:
+        app: sre-agent
+    spec:
+      serviceAccountName: ai-agent
+      containers:
+      - name: agent
+        image: ghcr.io/skarj/ai-agents:latest
+        imagePullPolicy: Always
+        env:
+          - name: TELEGRAM_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: sre-agent-secrets
+                key: token
+          - name: TELEGRAM_CHAT_ID
+            valueFrom:
+              secretKeyRef:
+                name: sre-agent-secrets
+                key: chat-id
+          - name: OLLAMA_URL
+            value: "http://ollama:11434"
+          - name: MCP_URL
+            value: "http://mcp-k8s:8080/sse"
+          - name: LANGGRAPH_STRICT_MSGPACK
+            value: "true" # Security
+        resources:
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+        volumeMounts:
+          - name: memory-vol
+            mountPath: /app/data
+      volumes:
+        - name: memory-vol
+          persistentVolumeClaim:
+            claimName: agent-memory-pvc
