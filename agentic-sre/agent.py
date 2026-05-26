@@ -43,8 +43,6 @@ class AgentState(TypedDict):
 # --- DYNAMIC PARAMETER PASSTHROUGH SCHEMA ---
 class AnyArgsModel(BaseModel):
     """Pydantic model that preserves dynamic arguments instead of stripping them."""
-    class Config:
-        extra = "allow"  # Fallback compatibility for Pydantic v1
     model_config = {"extra": "allow"}  # Compatibility for Pydantic v2
 
 # --- DYNAMIC MCP TOOL DISCOVERY ---
