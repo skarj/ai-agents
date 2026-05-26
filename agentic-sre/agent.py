@@ -3,7 +3,7 @@ import asyncio
 import sys
 import logging
 import json
-from typing import Annotated, TypedDict
+from typing import Annotated, TypedDict, Any
 
 from ollama import AsyncClient
 from mcp import ClientSession
@@ -15,7 +15,7 @@ from langchain_core.tools import StructuredTool
 from telebot.async_telebot import AsyncTeleBot
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, create_model
 
 # --- LOGGING CONFIGURATION ---
 logging.basicConfig(
@@ -58,13 +58,55 @@ async def fetch_mcp_tools():
             ollama_format_tools = []
 
             for t in mcp_tools.tools:
-                def create_tool_fn(t_name=t.name, schema=t.inputSchema):
+                schema = t.inputSchema
+                properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                required = schema.get("required", []) if isinstance(schema, dict) else []
+
+                # Dynamically construct Pydantic fields matching the MCP JSON Schema properties
+                fields = {}
+                for field_name, field_schema in properties.items():
+                    # Determine python type equivalent of JSON Schema types
+                    field_type = Any
+                    if isinstance(field_schema, dict):
+                        json_type = field_schema.get("type")
+                        if json_type == "integer":
+                            field_type = int
+                        elif json_type == "number":
+                            field_type = float
+                        elif json_type == "boolean":
+                            field_type = bool
+                        elif json_type == "array":
+                            field_type = list
+                        elif json_type == "object":
+                            field_type = dict
+                        elif json_type == "string":
+                            field_type = str
+
+                    # Set default value or Ellipsis if field is mandatory
+                    if field_name in required:
+                        default_value = ...
+                    else:
+                        default_value = None
+
+                    description = field_schema.get("description", "") if isinstance(field_schema, dict) else ""
+                    fields[field_name] = (field_type, Field(default=default_value, description=description))
+
+                # Create validation model subclassing AnyArgsModel to preserve additional params
+                tool_args_model = create_model(
+                    f"{t.name}Model",
+                    __base__=AnyArgsModel,
+                    **fields
+                )
+
+                def create_tool_fn(t_name=t.name, schema_spec=t.inputSchema):
                     async def func(**kwargs):
                         # Extract arguments from LangChain's internal wrapper
                         actual_args = kwargs.get('v__args', kwargs)
+                        if isinstance(actual_args, BaseModel):
+                            actual_args = actual_args.model_dump()
 
                         # Filter arguments to ensure we only send properties expected by the MCP tool
-                        expected_keys = schema.get("properties", {}).keys() if isinstance(schema, dict) else []
+                        expected_keys = schema_spec.get("properties", {}).keys() if isinstance(schema_spec, dict) else []
                         filtered_args = {k: v for k, v in actual_args.items() if k in expected_keys}
 
                         logger.info(f"🛠️ MCP CALL: {t_name} with {filtered_args}")
@@ -84,12 +126,12 @@ async def fetch_mcp_tools():
                             return error_msg
                     return func
 
-                # We pass AnyArgsModel as args_schema to let all arguments pass validation
+                # We pass the dynamically generated Pydantic model as args_schema
                 tools_list.append(StructuredTool.from_function(
                     coroutine=create_tool_fn(t.name, t.inputSchema),
                     name=t.name,
                     description=t.description,
-                    args_schema=AnyArgsModel
+                    args_schema=tool_args_model
                 ))
 
                 ollama_format_tools.append({
@@ -252,6 +294,8 @@ async def main():
             if call.data == "approve":
                 await bot.answer_callback_query(call.id, "Executing...")
 
+                # FIX: When resuming the stream, the first yielded state is the pre-existing
+                # checkpoint containing the same tool calls we just approved.
                 # Skipping the first event avoids triggering duplicate approval buttons in Telegram.
                 is_first = True
                 async for event in graph.astream(None, config, stream_mode="values"):
