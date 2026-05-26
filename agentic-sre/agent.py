@@ -238,7 +238,12 @@ async def main():
         async def handle_approval(call):
             if call.data == "approve":
                 await bot.answer_callback_query(call.id, "Executing...")
+                # Skipping the first event avoids triggering duplicate approval buttons in Telegram.
+                is_first = True
                 async for event in graph.astream(None, config, stream_mode="values"):
+                    if is_first:
+                        is_first = False
+                        continue
                     await notify_telegram(event)
             else:
                 await bot.answer_callback_query(call.id, "Aborted.")
