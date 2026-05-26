@@ -15,6 +15,7 @@ from langchain_core.tools import StructuredTool
 from telebot.async_telebot import AsyncTeleBot
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pydantic import BaseModel
 
 # --- LOGGING CONFIGURATION ---
 logging.basicConfig(
@@ -39,6 +40,13 @@ ollama_client = AsyncClient(host=OLLAMA_URL, timeout=180.0)
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], "The conversation history"]
 
+# --- DYNAMIC PARAMETER PASSTHROUGH SCHEMA ---
+class AnyArgsModel(BaseModel):
+    """Pydantic model that preserves dynamic arguments instead of stripping them."""
+    class Config:
+        extra = "allow"  # Fallback compatibility for Pydantic v1
+    model_config = {"extra": "allow"}  # Compatibility for Pydantic v2
+
 # --- DYNAMIC MCP TOOL DISCOVERY ---
 async def fetch_mcp_tools():
     """Connects to the MCP server and translates Kubernetes tools for the AI."""
@@ -52,16 +60,21 @@ async def fetch_mcp_tools():
             ollama_format_tools = []
 
             for t in mcp_tools.tools:
-                def create_tool_fn(t_name=t.name):
+                def create_tool_fn(t_name=t.name, schema=t.inputSchema):
                     async def func(**kwargs):
-                        # Fix: Handle LangChain wrapping arguments in v__args
+                        # Extract arguments from LangChain's internal wrapper
                         actual_args = kwargs.get('v__args', kwargs)
-                        logger.info(f"🛠️ MCP CALL: {t_name} with {actual_args}")
+
+                        # Filter arguments to ensure we only send properties expected by the MCP tool
+                        expected_keys = schema.get("properties", {}).keys() if isinstance(schema, dict) else []
+                        filtered_args = {k: v for k, v in actual_args.items() if k in expected_keys}
+
+                        logger.info(f"🛠️ MCP CALL: {t_name} with {filtered_args}")
                         try:
                             async with sse_client(MCP_URL) as (r, w):
                                 async with ClientSession(r, w) as sess:
                                     await sess.initialize()
-                                    res = await sess.call_tool(t_name, actual_args)
+                                    res = await sess.call_tool(t_name, filtered_args)
 
                                     # Extract clean text from MCP response objects
                                     if hasattr(res, 'content') and isinstance(res.content, list):
@@ -73,10 +86,12 @@ async def fetch_mcp_tools():
                             return error_msg
                     return func
 
+                # We pass AnyArgsModel as args_schema to let all arguments pass validation
                 tools_list.append(StructuredTool.from_function(
-                    coroutine=create_tool_fn(t.name),
+                    coroutine=create_tool_fn(t.name, t.inputSchema),
                     name=t.name,
-                    description=t.description
+                    description=t.description,
+                    args_schema=AnyArgsModel
                 ))
 
                 ollama_format_tools.append({
@@ -238,6 +253,7 @@ async def main():
         async def handle_approval(call):
             if call.data == "approve":
                 await bot.answer_callback_query(call.id, "Executing...")
+
                 # Skipping the first event avoids triggering duplicate approval buttons in Telegram.
                 is_first = True
                 async for event in graph.astream(None, config, stream_mode="values"):
