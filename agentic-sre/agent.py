@@ -3,7 +3,7 @@ import asyncio
 import sys
 import logging
 import json
-from typing import Annotated, TypedDict, Any
+from typing import Annotated, TypedDict, Any, Optional
 
 from ollama import AsyncClient
 from mcp import ClientSession
@@ -87,6 +87,7 @@ async def fetch_mcp_tools():
                         default_value = ...
                     else:
                         default_value = None
+                        field_type = Optional[field_type]
 
                     description = field_schema.get("description", "") if isinstance(field_schema, dict) else ""
                     fields[field_name] = (field_type, Field(default=default_value, description=description))
@@ -106,8 +107,9 @@ async def fetch_mcp_tools():
                             actual_args = actual_args.model_dump()
 
                         # Filter arguments to ensure we only send properties expected by the MCP tool
+                        # and drop None values to prevent validation errors in the underlying tool
                         expected_keys = schema_spec.get("properties", {}).keys() if isinstance(schema_spec, dict) else []
-                        filtered_args = {k: v for k, v in actual_args.items() if k in expected_keys}
+                        filtered_args = {k: v for k, v in actual_args.items() if k in expected_keys and v is not None}
 
                         logger.info(f"🛠️ MCP CALL: {t_name} with {filtered_args}")
                         try:
