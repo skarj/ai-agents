@@ -1,0 +1,17 @@
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: sre-agent
+  namespace: argocd # Must the same namespace as ArgoCD
+spec:
+  writeBackConfig:
+    method: argocd
+  applicationRefs:
+    - namePattern: "sre-agent"
+      images:
+        - alias: agent
+          # To track a mutable tag via digest, include the target tag directly in the imageName string
+          imageName: ghcr.io/skarj/ai-agents:latest
+          # "digest" strategy checks for changes to the underlying SHA of your mutable tag
+          commonUpdateSettings:
+            updateStrategy: digest

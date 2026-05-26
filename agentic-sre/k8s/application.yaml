@@ -3,6 +3,7 @@ kind: Application
 metadata:
   name: sre-agent
   namespace: argocd
+
 spec:
   project: default
   source:
@@ -10,15 +11,10 @@ spec:
     targetRevision: main
     path: agentic-sre/k8s
 
-    # Ignore itself to prevent overhead
-    ignoreManifests:
-      - name: sre-agent
-        kind: Application
-        group: argoproj.io
-
   destination:
     server: 'https://kubernetes.default.svc'
     namespace: ai-agents
+
   syncPolicy:
     automated:
       prune: true
