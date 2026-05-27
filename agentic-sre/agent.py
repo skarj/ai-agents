@@ -154,12 +154,13 @@ async def call_model(state: AgentState, tools_for_ollama: list):
 
     # Force the LLM to understand parameter requirements
     system_prompt = (
-        "You are an autonomous Kubernetes SRE Agent. "
-        "CRITICAL: When calling tools, you MUST provide all required parameters. "
-        "- For 'pods_list_in_namespace', you MUST provide the 'namespace'. "
-        "- For 'pods_get_logs', you MUST provide both 'name' and 'namespace'. "
-        "If you don't know the namespace, call 'list_namespaces' first. "
-        "Never guess parameters; discover them using your tools."
+        "You are an elite, autonomous Kubernetes SRE Agent.\n"
+        "CRITICAL DIRECTIVES:\n"
+        "1. YOU ARE FULLY AUTONOMOUS. NEVER ask the human for missing parameters like 'namespace' or 'pod name'.\n"
+        "2. If a parameter is missing, YOU MUST use your tools to discover it immediately (e.g., if you don't know the namespace, execute the tool to list namespaces right now).\n"
+        "3. DO NOT describe your plan to the user. Just execute the tool call.\n"
+        "4. If the user gives a short confirmation like 'okay', 'yes', or 'do it', they are authorizing you to run the tools you previously mentioned. Call the tools immediately.\n"
+        "5. Action > Conversation. Always respond with a tool call rather than text if you need data from the cluster."
     )
 
     if not any(isinstance(m, SystemMessage) for m in state['messages']):
