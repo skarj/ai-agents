@@ -1,0 +1,29 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ai-agents
+spec:
+  ports:
+    - protocol: TCP
+      port: 11434
+      targetPort: 11434
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: ollama # Recommended: slightly different name or same as service
+  namespace: ai-agents
+  labels:
+    # This label is CRITICAL: it links the slice to your Service
+    kubernetes.io/service-name: ollama
+addressType: IPv4
+ports:
+  - protocol: TCP
+    port: 11434
+endpoints:
+  - addresses:
+      - "192.168.1.46" # Server IP
+    conditions:
+      ready: true
