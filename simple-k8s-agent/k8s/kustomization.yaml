@@ -11,4 +11,4 @@ resources:
 # Argo CD Image Updater modifies or appends to this section
 images:
   - name: ghcr.io/skarj/ai-agents-simple-k8s-agent
-    newTag: sha-2ed52eb
+    newTag: sha-ef28233
