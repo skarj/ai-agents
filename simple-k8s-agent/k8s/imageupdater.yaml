@@ -9,7 +9,7 @@ spec:
     method: "git:secret:argocd/github-write-creds"
     gitConfig:
       branch: "main"
-      writeBackTarget: "kustomization:simple-k8s-agent/k8s"
+      writeBackTarget: "kustomization:."
       user: "argocd-image-updater[bot]"
       email: "argocd-bot@users.noreply.github.com"
   applicationRefs:
