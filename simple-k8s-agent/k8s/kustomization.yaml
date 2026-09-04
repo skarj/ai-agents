@@ -6,6 +6,8 @@ resources:
   - rbac.yaml
   - services.yaml
   - routes.yaml
+  - ollama.yaml
+  - pvc.yaml
 
 # Argo CD Image Updater modifies or appends to this section
 images:
