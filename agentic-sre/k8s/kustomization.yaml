@@ -6,3 +6,9 @@ resources:
   - pvc.yaml
   - rbac.yaml
   - resourcequota.yaml
+
+# Argo CD Image Updater modifies or appends to this section
+images:
+  - name: ghcr.io/skarj/ai-agents-agentic-sre
+    newName: ghcr.io/skarj/ai-agents-agentic-sre
+    newTag: sha-9035aa1
