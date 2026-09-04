@@ -5,7 +5,7 @@ metadata:
   namespace: argocd # Must the same namespace as ArgoCD
 spec:
   writeBackConfig:
-   # References secret: git:secret:<namespace>/<secret-name>
+    # References secret: git:secret:<namespace>/<secret-name>
     method: "git:secret:argocd/github-write-creds"
     gitConfig:
       branch: "main"

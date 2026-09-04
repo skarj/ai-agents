@@ -3,11 +3,12 @@ kind: Kustomization
 
 resources:
   - deployment.yaml
-  - rbac.yaml
-  - services.yaml
-  - routes.yaml
+  - imageupdater.yaml
   - ollama.yaml
   - pvc.yaml
+  - rbac.yaml
+  - routes.yaml
+  - services.yaml
 
 # Argo CD Image Updater modifies or appends to this section
 images:
