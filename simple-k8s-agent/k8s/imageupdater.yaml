@@ -5,16 +5,20 @@ metadata:
   namespace: argocd # Must the same namespace as ArgoCD
 spec:
   writeBackConfig:
-    method: git
+   # References secret: git:secret:<namespace>/<secret-name>
+    method: "git:secret:argocd/github-write-creds"
     gitConfig:
-      branch: main
-      writeBackTarget: "kustomization:."
+      branch: "main"
+      writeBackTarget: "kustomization:simple-k8s-agent/k8s"
+      user: "argocd-image-updater[bot]"
+      email: "argocd-bot@users.noreply.github.com"
   applicationRefs:
     - namePattern: "simple-k8s-agent"
       images:
-        - alias: api
-          # To track a mutable tag via digest, include the target tag directly in the imageName string
-          imageName: ghcr.io/skarj/ai-agents-simple-k8s-agent
-          # "digest" strategy checks for changes to the underlying SHA of your mutable tag
+        - alias: "api"
+          imageName: "ghcr.io/skarj/ai-agents-simple-k8s-agent"
           commonUpdateSettings:
-            updateStrategy: digest
+            # Sorts matching tags by image creation date in the registry
+            updateStrategy: "latest"
+            # Matches tags starting with 'sha-' followed by a 7-character hex hash
+            allowedTags: "^sha-[a-f0-9]{7}$"
