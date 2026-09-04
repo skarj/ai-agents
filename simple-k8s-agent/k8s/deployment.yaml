@@ -16,7 +16,7 @@ spec:
       serviceAccountName: ai-devops-api
       containers:
         - name: api
-          image: ghcr.io/skarj/ai-agents:latest
+          image: ghcr.io/skarj/ai-agents-simple-k8s-agent:latest
           ports:
             - containerPort: 8000
           env:
