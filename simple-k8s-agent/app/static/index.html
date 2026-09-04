@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Local K8s AI Agent</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: linear-gradient(135deg, #dbeafe 0%, #ede9fe 100%);
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .chat {
+    width: 100%;
+    max-width: 720px;
+    height: 90vh;
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  header {
+    padding: 18px 24px;
+    background: linear-gradient(90deg, #3b82f6 0%, #8b5cf6 100%);
+    color: #fff;
+  }
+  header h1 { font-size: 1.1rem; font-weight: 600; }
+  header p  { font-size: 0.8rem; opacity: 0.85; margin-top: 2px; }
+  .mode-bar {
+    display: flex;
+    gap: 4px;
+    padding: 8px 16px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+  }
+  .mode-btn {
+    padding: 6px 12px;
+    background: transparent;
+    color: #475569;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .mode-btn.active { background: #3b82f6; color: #fff; border-color: #3b82f6; }
+  #ns-row {
+    display: none;
+    padding: 8px 16px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    color: #475569;
+  }
+  #ns-row.show { display: flex; }
+  #ns {
+    flex: 1;
+    padding: 6px 10px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    font-size: 0.85rem;
+  }
+  details.context {
+    margin-top: 6px;
+    font-size: 0.8rem;
+    color: #64748b;
+  }
+  details.context summary { cursor: pointer; user-select: none; }
+  details.context pre {
+    margin-top: 6px;
+    padding: 8px;
+    background: #f1f5f9;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-family: ui-monospace, monospace;
+    font-size: 0.75rem;
+    line-height: 1.4;
+  }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .msg {
+    max-width: 80%;
+    padding: 10px 14px;
+    border-radius: 12px;
+    white-space: pre-wrap;
+    line-height: 1.5;
+    font-size: 0.95rem;
+  }
+  .user { background: #dbeafe; color: #1e3a5f; align-self: flex-end; border-bottom-right-radius: 4px; }
+  .bot  { background: #f1f5f9; color: #1e293b; align-self: flex-start; border-bottom-left-radius: 4px; }
+  .bot.thinking { color: #64748b; font-style: italic; }
+  form {
+    display: flex;
+    gap: 8px;
+    padding: 16px;
+    border-top: 1px solid #e2e8f0;
+    background: #fafafa;
+  }
+  input {
+    flex: 1;
+    padding: 10px 14px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    outline: none;
+  }
+  input:focus { border-color: #3b82f6; }
+  input:disabled { background: #f1f5f9; }
+  button {
+    padding: 10px 20px;
+    background: #3b82f6;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  button:hover:not(:disabled) { background: #2563eb; }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
+</style>
+</head>
+<body>
+  <div class="chat">
+    <header>
+      <h1>Local K8s AI Agent</h1>
+      <p>Ask anything about Kubernetes - runs locally on your own LLM</p>
+    </header>
+    <div class="mode-bar">
+      <button class="mode-btn active" data-mode="ask">Ask</button>
+      <button class="mode-btn" data-mode="diagnose">Diagnose Cluster</button>
+    </div>
+    <div id="ns-row">
+      <label for="ns">Namespace:</label>
+      <input id="ns" value="ai-devops" autocomplete="off">
+    </div>
+    <div id="messages"></div>
+    <form id="form">
+      <input id="q" placeholder="e.g. My pod is in CrashLoopBackOff..." autocomplete="off" required>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </div>
+<script>
+const $msgs = document.getElementById("messages");
+const $form = document.getElementById("form");
+const $q = document.getElementById("q");
+const $send = document.getElementById("send");
+const $ns = document.getElementById("ns");
+const $nsRow = document.getElementById("ns-row");
+const $modeBtns = document.querySelectorAll(".mode-btn");
+
+let mode = "ask";
+
+$modeBtns.forEach((b) => {
+  b.addEventListener("click", () => {
+    $modeBtns.forEach((x) => x.classList.remove("active"));
+    b.classList.add("active");
+    mode = b.dataset.mode;
+    $nsRow.classList.toggle("show", mode === "diagnose");
+    $q.placeholder = mode === "diagnose"
+      ? "e.g. Why isn't my app responding?"
+      : "e.g. My pod is in CrashLoopBackOff...";
+  });
+});
+
+function addMsg(text, who, extraClass = "") {
+  const el = document.createElement("div");
+  el.className = `msg ${who} ${extraClass}`;
+  el.textContent = text;
+  $msgs.appendChild(el);
+  $msgs.scrollTop = $msgs.scrollHeight;
+  return el;
+}
+
+function addContextBlock(parent, contextText) {
+  const det = document.createElement("details");
+  det.className = "context";
+  det.innerHTML = `<summary>Cluster state used as context</summary><pre></pre>`;
+  det.querySelector("pre").textContent = contextText;
+  parent.appendChild(det);
+}
+
+$form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const question = $q.value.trim();
+  if (!question) return;
+  addMsg(question, "user");
+  $q.value = "";
+  $q.disabled = $send.disabled = true;
+  const thinking = addMsg(
+    mode === "diagnose"
+      ? "Reading cluster state and reasoning... (can take 1-2 minutes on CPU)"
+      : "Thinking... (can take 1-2 minutes on CPU)",
+    "bot",
+    "thinking"
+  );
+  try {
+    const endpoint = mode === "diagnose" ? "/diagnose" : "/ask";
+    const body = mode === "diagnose"
+      ? { question, namespace: $ns.value || "ai-devops" }
+      : { question };
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    thinking.remove();
+    const botMsg = addMsg(data.answer || `Error: ${data.detail || "no response"}`, "bot");
+    if (mode === "diagnose" && data.context) addContextBlock(botMsg, data.context);
+  } catch (err) {
+    thinking.remove();
+    addMsg(`Error: ${err.message}`, "bot");
+  } finally {
+    $q.disabled = $send.disabled = false;
+    $q.focus();
+  }
+});
+
+$q.focus();
+</script>
+</body>
+</html>
