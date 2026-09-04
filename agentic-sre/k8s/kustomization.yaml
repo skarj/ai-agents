@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
   - deployment.yaml
+  - imageupdater.yaml
   - mcp.yaml
   - namespace.yaml
   - pvc.yaml
