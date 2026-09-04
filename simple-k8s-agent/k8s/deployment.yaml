@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-devops-api
+  namespace: ai-agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-devops-api
+  template:
+    metadata:
+      labels:
+        app: ai-devops-api
+    spec:
+      serviceAccountName: ai-devops-api
+      containers:
+        - name: api
+          image: ghcr.io/skarj/ai-agents:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: OLLAMA_URL
+              value: "http://ollama:11434"
+            - name: MODEL
+              value: "mistral"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
