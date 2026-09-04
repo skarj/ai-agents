@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ai-devops-api
+  name: k8s-agent-api
   namespace: ai-agents
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: ai-devops-api
+      app: k8s-agent-api
   template:
     metadata:
       labels:
-        app: ai-devops-api
+        app: k8s-agent-api
     spec:
-      serviceAccountName: ai-devops-api
+      serviceAccountName: k8s-agent-api
       containers:
         - name: api
           image: ghcr.io/skarj/ai-agents-simple-k8s-agent:latest

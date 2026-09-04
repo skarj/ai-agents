@@ -13,11 +13,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: ai-devops-api
+  name: k8s-agent-api
   namespace: ai-agents
 spec:
   selector:
-    app: ai-devops-api
+    app: k8s-agent-api
   ports:
     - port: 80
       targetPort: 8000
