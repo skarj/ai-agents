@@ -147,4 +147,3 @@ async def list_models():
     async with httpx.AsyncClient(timeout=10.0) as c:
         resp = await c.get(f"{OLLAMA_URL}/api/tags")
         return resp.json()
-
